@@ -1,0 +1,9 @@
+artifacts/
+cache/
+__pycache__/
+*.py[cod]
+.venv/
+.venv*/
+pip-*/
+tmp*/
+
