@@ -21,10 +21,10 @@ hermes plugins validate . --install-deps
 ```
 
 The plugin has no API keys, does not read `.env` and does not spawn shell or
-background processes. While reading public COG ranges it may create a short-lived
-localhost proxy thread; the thread is shut down when the read context exits. It
-stores only downloaded raster cache and generated maps below its own `artifacts/`
-directory. Network calls are made only to:
+background processes or local servers. It stores downloaded raster cache and
+generated maps under `$HERMES_HOME/plugin-data/field-from-above/` (cache capped at
+2 GB, least recently used files evicted; one band file at most 400 MB). Band files
+are downloaded only over https from `sentinel-cogs.s3.us-west-2.amazonaws.com`. Network calls are made only to:
 
 * `uldk.gugik.gov.pl` — Polish parcel boundaries;
 * `earth-search.aws.element84.com` — Sentinel-2 STAC and public COG assets;

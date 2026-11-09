@@ -20,8 +20,17 @@ from typing import Any
 
 ULDK_URL = "https://uldk.gugik.gov.pl/"
 STAC_URL = "https://earth-search.aws.element84.com/v1/search"
-PLUGIN_DIR = Path(__file__).resolve().parent
-ARTIFACT_DIR = PLUGIN_DIR / "artifacts"
+
+
+def _data_dir() -> Path:
+    """Plugin data lives under HERMES_HOME, never inside the install directory."""
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home())
+    except Exception:  # noqa: BLE001 - outside Hermes (tests, CLI) fall back to the documented default
+        import os
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return home / "plugin-data" / "field-from-above"
 DISCLAIMER = "This is a dated satellite measurement and terrain context, not a soil test, fertiliser recommendation, plant-protection recommendation, or agronomic diagnosis."
 _WKT_RE = re.compile(r"^(?:MULTI)?POLYGON\s*\(", re.IGNORECASE)
 
@@ -246,7 +255,8 @@ def _measure_scene(geometry: Any, label: str, season: int) -> dict[str, Any]:
     latitude = float(geometry.centroid.y)
     crs = _utm_epsg(longitude, latitude)
     grid, geometry_local = _grid_for(geometry, crs)
-    cache = ARTIFACT_DIR / "cache"
+    data_dir = _data_dir()
+    cache = data_dir / "cache"
     bands: dict[str, Any] = {}
     for name, method in (("B05", "bilinear"), ("B08", "bilinear"), ("SCL", "nearest")):
         href = sentinel.href_pasma(scene, name)
@@ -259,7 +269,7 @@ def _measure_scene(geometry: Any, label: str, season: int) -> dict[str, Any]:
     ndvi = sentinel.ndvi(sentinel.odbicie(bands["B08"]), sentinel.odbicie(b04))
     stats = sentinel.statystyki(mask, bands["SCL"], ndvi, ndre, label, float(geometry_local.area / 10000.0))
     safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
-    map_path = ARTIFACT_DIR / f"{safe_label}-ndre-{scene_date}.png"
+    map_path = data_dir / "maps" / f"{safe_label}-ndre-{scene_date}.png"
     _render_map(map_path, np.where(mask, ndre, np.nan), grid, geometry, scene_date, crs)
     return {
         "status": "OK",

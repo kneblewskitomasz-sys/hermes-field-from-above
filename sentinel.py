@@ -21,13 +21,10 @@ To jest ograniczenie środowiska, nie źródła — zapisane w raporcie.
 
 from __future__ import annotations
 
-import http.server
 import json
 import math
 import os
 import re
-import socketserver
-import threading
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -84,15 +81,59 @@ def _nazwa_cache(href: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", href.rsplit("/", 2)[-2] + "_" + href.rsplit("/", 1)[-1])
 
 
-def pobierz_plik(href: str, katalog: str | Path) -> Path:
-    """Ściągnij COG do cache raz; drugie wywołanie nie rusza sieci."""
+# Band files come only from the Earth Search Sentinel-2 bucket, over https.
+DOZWOLONE_HOSTY = frozenset({"sentinel-cogs.s3.us-west-2.amazonaws.com"})
+MAKS_PLIK = 400 * 1024 * 1024        # one band file; Sentinel-2 10 m bands are ~100-250 MB
+MAKS_CACHE = 2 * 1024 * 1024 * 1024  # whole cache; oldest files are evicted first
+
+
+def sprawdz_href(href: str) -> str:
+    """Refuse anything that is not https on the expected asset host."""
+    czesci = urllib.parse.urlsplit(href)
+    if czesci.scheme != "https" or (czesci.hostname or "").lower() not in DOZWOLONE_HOSTY:
+        raise ValueError(f"band URL rejected (need https on {sorted(DOZWOLONE_HOSTY)}): {href[:120]}")
+    return href
+
+
+def _przytnij_cache(katalog: Path, zostaw: Path | None = None, limit: int | None = None) -> None:
+    """Evict least recently used files until the cache fits under the limit."""
+    limit = MAKS_CACHE if limit is None else limit
+    pliki = [p for p in katalog.iterdir() if p.is_file() and p != zostaw]
+    razem = sum(p.stat().st_size for p in pliki) + (zostaw.stat().st_size if zostaw and zostaw.exists() else 0)
+    for plik in sorted(pliki, key=lambda p: p.stat().st_mtime):
+        if razem <= limit:
+            break
+        razem -= plik.stat().st_size
+        plik.unlink(missing_ok=True)
+
+
+def pobierz_plik(href: str, katalog: str | Path, maks: int = MAKS_PLIK) -> Path:
+    """Download a COG into the cache once; a second call does not touch the network."""
+    sprawdz_href(href)
     katalog = Path(katalog)
     katalog.mkdir(parents=True, exist_ok=True)
     cel = katalog / _nazwa_cache(href)
     if cel.exists() and cel.stat().st_size > 0:
+        os.utime(cel)  # mark as recently used for eviction
         return cel
-    dane = _get(href, timeout=600)
-    cel.write_bytes(dane)
+    tymczasowy = cel.with_suffix(cel.suffix + ".part")
+    zadanie = urllib.request.Request(href, headers={"User-Agent": "field-from-above/0.1"})
+    try:
+        with urllib.request.urlopen(zadanie, timeout=600) as odp:
+            dlugosc = int(odp.headers.get("Content-Length") or 0)
+            if dlugosc > maks:
+                raise ValueError(f"band file too large: {dlugosc} B > {maks} B")
+            pobrano = 0
+            with open(tymczasowy, "wb") as plik:
+                while porcja := odp.read(1 << 20):
+                    pobrano += len(porcja)
+                    if pobrano > maks:
+                        raise ValueError(f"band file exceeded {maks} B while downloading")
+                    plik.write(porcja)
+        tymczasowy.replace(cel)
+    finally:
+        tymczasowy.unlink(missing_ok=True)
+    _przytnij_cache(katalog, zostaw=cel)
     return cel
 
 
@@ -296,87 +337,3 @@ def data_sceny(item: dict) -> str:
     return str(item["properties"]["datetime"])[:10]
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Lokalne przekierowanie HTTP — obejście schannel na tym laptopie
-# ────────────────────────────────────────────────────────────────────────────
-#
-# Zmierzone 02.11.2026: GDAL z tego koła (rasterio 3.12.1, libcurl/schannel)
-# nie otwiera COG po https — `AcquireCredentialsHandle failed:
-# SEC_E_NO_CREDENTIALS`. To nie jest wina S3: `urllib` (OpenSSL) czyta ten sam
-# plik bez problemu. Dlatego GDAL dostaje adres `http://127.0.0.1:port/<https>`,
-# a lokalny wątek przepisuje żądania (w tym Range) przez `urllib`. Ruch idzie
-# tylko na pętlę zwrotną; serwer żyje tyle, co przebieg.
-
-class _Przekierowanie(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *_):  # cisza: nie zaśmiecamy logu przebiegu
-        pass
-
-    def do_HEAD(self):
-        self._obsluz(True)
-
-    def do_GET(self):
-        self._obsluz(False)
-
-    def _obsluz(self, head: bool):
-        url = urllib.parse.unquote(self.path[1:])
-        if not url.startswith(("http://", "https://")):
-            self.send_error(400, "adres nie jest http(s)")
-            return
-        naglowki = {"User-Agent": "field-from-above/0.1"}
-        zakres = self.headers.get("Range")
-        if zakres:
-            naglowki["Range"] = zakres
-        zadanie = urllib.request.Request(url, headers=naglowki,
-                                         method="HEAD" if head else "GET")
-        try:
-            with urllib.request.urlopen(zadanie, timeout=180) as odp:
-                self.send_response(odp.status)
-                for klucz in ("Content-Type", "Content-Length", "Content-Range",
-                              "Last-Modified", "ETag"):
-                    wartosc = odp.headers.get(klucz)
-                    if wartosc:
-                        self.send_header(klucz, wartosc)
-                self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
-                if not head:
-                    dl = int(odp.headers.get("Content-Length") or 0)
-                    pozostalo = dl
-                    while pozostalo > 0:
-                        porcja = odp.read(min(65536, pozostalo))
-                        if not porcja:
-                            break
-                        self.wfile.write(porcja)
-                        pozostalo -= len(porcja)
-        except Exception as blad:  # noqa: BLE001 — klient GDAL ma dostać kod, nie wyjątek
-            try:
-                self.send_error(502, str(blad).encode("ascii", "replace").decode("ascii"))
-            except Exception:  # noqa: BLE001 — klient już zamknął połączenie
-                pass
-
-
-class _SerwerPrzekierowania(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    daemon_threads = True
-
-
-class Przekierowanie:
-    """Kontekst: start lokalnego proxy i tłumaczenie adresów COG na nie."""
-
-    def __init__(self):
-        self.serwer: _SerwerPrzekierowania | None = None
-        self.port: int | None = None
-
-    def __enter__(self):
-        self.serwer = _SerwerPrzekierowania(("127.0.0.1", 0), _Przekierowanie)
-        self.port = self.serwer.server_address[1]
-        threading.Thread(target=self.serwer.serve_forever, daemon=True).start()
-        return self
-
-    def adres(self, href: str) -> str:
-        if self.port is None:
-            raise RuntimeError("przekierowanie nie zostało uruchomione")
-        return f"http://127.0.0.1:{self.port}/{href}"
-
-    def __exit__(self, *_):
-        if self.serwer is not None:
-            self.serwer.shutdown()
-            self.serwer.server_close()
